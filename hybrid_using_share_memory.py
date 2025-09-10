@@ -7,11 +7,30 @@ dtype = torch.bfloat16
 
 def gpu_worker(shared_input, shared_output, ready_event, done_event):
     # === Step 1. GPU writes tensor into shared pinned input ===
-    gpu_tensor = torch.arange(shared_input.numel(), device="cuda", dtype=shared_input.dtype).reshape(shared_input.size())
+    gpu_tensor = torch.randn(shared_input.numel(), device="cuda", dtype=shared_input.dtype).reshape(shared_input.size())
     
-    # TODO: collect the time of this operation: GPU to CPU
-    shared_input.copy_(gpu_tensor.cpu(), non_blocking=True)
+    # Create CUDA events for timing
+    start_event_cpu = torch.cuda.Event(enable_timing=True)
+    end_event_cpu = torch.cuda.Event(enable_timing=True)
+    start_event_copy = torch.cuda.Event(enable_timing=True)
+    end_event_copy = torch.cuda.Event(enable_timing=True)
+
+    # TODO: directly write the result of .cpu() into shared_input?
     
+    # Record start of .cpu()
+    start_event_cpu.record()
+    cpu_tensor = gpu_tensor.cpu()  # device transfer
+    end_event_cpu.record()
+    torch.cuda.synchronize()
+    print(f"[GPU] GPU -> CPU (.cpu()) took {start_event_cpu.elapsed_time(end_event_cpu):.3f} ms")
+
+    # Record start of copy_ into shared pinned memory
+    start_event_copy.record()
+    shared_input.copy_(cpu_tensor, non_blocking=True)
+    end_event_copy.record()
+    torch.cuda.synchronize()
+    print(f"[GPU] Copy into shared pinned memory took {start_event_copy.elapsed_time(end_event_copy):.3f} ms")
+
     print("[GPU] Wrote tensor into shared pinned input")
 
     # Signal CPU that input is ready
@@ -21,9 +40,11 @@ def gpu_worker(shared_input, shared_output, ready_event, done_event):
     done_event.wait()
 
     # === Step 3. GPU reads reduced result from shared pinned output ===
-
-    # TODO: collect the time of this operation: CPU to GPU
+    start_event_copy.record()
     result_gpu = shared_output.to("cuda", non_blocking=True)
+    end_event_copy.record()
+    torch.cuda.synchronize()
+    print(f"[GPU] CPU -> GPU copy took {start_event_copy.elapsed_time(end_event_copy):.3f} ms")
 
     print("[GPU] Read reduced result back to GPU:", result_gpu)
 
@@ -36,9 +57,11 @@ def cpu_worker(shared_input, shared_output, ready_event, done_event):
 
     # === Step 2. CPU reduces the tensor ===
     print("[CPU] Reading shared input...")
-    s = shared_input.relu_()
-    shared_output.copy_(s, non_blocking=True)  # copy result into shared memory
-    print("[CPU] Wrote reduced result into shared output:", s)
+    
+    # We need a kernel which directly writes to shared_output
+    torch.exp(shared_input, out=shared_output)
+    
+    print("[CPU] Wrote reduced result into shared output:", shared_output)
 
     # Signal GPU that reduction is done
     done_event.set()
