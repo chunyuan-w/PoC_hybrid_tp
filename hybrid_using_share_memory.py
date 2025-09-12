@@ -2,16 +2,15 @@ import time
 import torch
 import torch.multiprocessing as mp
 
-M = 1024
-# M = 8
-K = 7168
-dtype = torch.bfloat16
-NUM_REPEATS = 1000  # number of times to repeat for averaging
+M = 4096
+M = 4
 
-# directly_write_to_shared_output = True
-directly_write_to_shared_output = False
-flush = True
-# flush = False
+K = 7168
+topk = 8
+dtype = torch.bfloat16
+NUM_REPEATS = 1000
+
+flush_cache = True
 
 a = torch.ones(256 * 1024 * 1024 // 4, dtype=torch.float)
 b = torch.ones(256 * 1024 * 1024 // 4, dtype=torch.float)
@@ -19,114 +18,113 @@ def flush():
     global a, b
     a += b
 
-def gpu_worker(shared_input, shared_output, ready_event, done_event):
-    # === Step 1. GPU writes tensor into shared pinned input ===
-    gpu_tensor = torch.randn(shared_input.numel(), device="cuda", dtype=shared_input.dtype).reshape(shared_input.size())
-    
-    # Create CUDA events for timing
+def gpu_worker(shared_hidden_states, shared_output,
+               shared_topk_weights, shared_topk_ids,
+               ready_event, done_event, result_queue):
+    gpu_hidden_states = torch.randn(shared_hidden_states.shape, device="cuda", dtype=shared_hidden_states.dtype)
+    gpu_topk_weights = torch.randn(shared_topk_weights.shape, device="cuda", dtype=shared_topk_weights.dtype)
+    gpu_topk_ids = torch.randint(0, K, shared_topk_ids.shape, device="cuda", dtype=shared_topk_ids.dtype)
+
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    cpu_times = []
-    copy_times = []
+    results = []
 
-    for i in range(NUM_REPEATS):
-        if flush:
-            flush()
-        
-        # Measure .cpu() time
-        start_event.record()
-        cpu_tensor = gpu_tensor.cpu()  # device transfer
-        end_event.record()
-        torch.cuda.synchronize()
-        cpu_times.append(start_event.elapsed_time(end_event))
+    # ---------------- GPU -> CPU (2 stages) ----------------
+    def measure_gpu_to_cpu(name, gpu_tensor, shared_tensor):
+        times_stage1, times_stage2 = [], []
+        for _ in range(NUM_REPEATS):
+            if flush_cache: flush()
+            # stage 1: GPU → CPU
+            start_event.record()
+            cpu_tensor = gpu_tensor.cpu()
+            end_event.record()
+            torch.cuda.synchronize()
+            times_stage1.append(start_event.elapsed_time(end_event))
 
-        # Measure copy_ into shared pinned memory
-        if flush:
-            flush()
-        start_event.record()
-        shared_input.copy_(cpu_tensor, non_blocking=True)
-        end_event.record()
-        torch.cuda.synchronize()
-        copy_times.append(start_event.elapsed_time(end_event))
+            if flush_cache: flush()
+            # stage 2: CPU → shared
+            start = time.perf_counter()
+            shared_tensor.copy_(cpu_tensor, non_blocking=True)
+            end = time.perf_counter()
+            times_stage2.append((end - start) * 1000)
 
-    print(f"[GPU] Average GPU -> CPU (.cpu()) time over {NUM_REPEATS} runs: {sum(cpu_times)/NUM_REPEATS:.3f} ms")
-    print(f"[GPU] Average copy into shared pinned memory time over {NUM_REPEATS} runs: {sum(copy_times)/NUM_REPEATS:.3f} ms")
+        results.append((f"{name}_gpu_to_cpu", sum(times_stage1)/NUM_REPEATS))
+        results.append((f"{name}_cpu_to_shared", sum(times_stage2)/NUM_REPEATS))
 
-    print("[GPU] Wrote tensor into shared pinned input")
+    measure_gpu_to_cpu("hidden_states", gpu_hidden_states, shared_hidden_states)
+    measure_gpu_to_cpu("topk_weights", gpu_topk_weights, shared_topk_weights)
+    measure_gpu_to_cpu("topk_ids", gpu_topk_ids, shared_topk_ids)
 
-    # Signal CPU that input is ready
     ready_event.set()
-
-    # Wait for CPU to finish reduction
     done_event.wait()
 
-    # === Step 3. GPU reads reduced result from shared pinned output ===
-    result_times = []
-    for i in range(NUM_REPEATS):
-        if flush:
-            flush()
+    # ---------------- CPU → GPU (2 stages, hidden_states only) ----------------
+    # Stage 1 timing comes from cpu_worker via result_queue
+    cpu_stage1_time = result_queue.get()
+
+    times_stage2 = []
+    for _ in range(NUM_REPEATS):
+        if flush_cache: flush()
         start_event.record()
-        result_gpu = shared_output.to("cuda", non_blocking=True)
+        _ = shared_output.to("cuda", non_blocking=True)
         end_event.record()
         torch.cuda.synchronize()
-        result_times.append(start_event.elapsed_time(end_event))
+        times_stage2.append(start_event.elapsed_time(end_event))
 
-    print(f"[GPU] Average CPU -> GPU copy time over {NUM_REPEATS} runs: {sum(result_times)/NUM_REPEATS:.3f} ms")
-    print("[GPU] Read reduced result back to GPU:", result_gpu)
+    results.append(("hidden_states_cpu_to_shared", cpu_stage1_time))
+    results.append(("hidden_states_shared_to_gpu", sum(times_stage2)/NUM_REPEATS))
+
+    # Print CSV
+    print("type,time_ms")
+    for t, ms in results:
+        print(f"{t},{ms:.3f}")
 
 
-def cpu_worker(shared_input, shared_output, ready_event, done_event):
-    # Wait for GPU to signal input is ready
+def cpu_worker(shared_hidden_states, shared_output,
+               shared_topk_weights, shared_topk_ids,
+               ready_event, done_event, result_queue):
     ready_event.wait()
 
-    # === Step 2. CPU reduces the tensor ===
-    print("[CPU] Reading shared input...")
+    times_stage1 = []
+    for _ in range(NUM_REPEATS):
+        if flush_cache: flush()
 
-    if directly_write_to_shared_output:
-        torch.exp(shared_input, out=shared_output)
-    else:
-        # Measure the time for shared_output.copy_
-        copy_times = []
-        for _ in range(NUM_REPEATS):
-            s = shared_input.relu()
-            if flush:
-                flush()
-            start = time.perf_counter()
-            shared_output.copy_(s)
-            end = time.perf_counter()
-            copy_times.append((end - start) * 1000)  # convert to milliseconds
+        cpu_tensor = shared_hidden_states.relu()
 
-        avg_time = sum(copy_times) / NUM_REPEATS
-        print(f"[CPU] Average shared_output.copy_(s) time over {NUM_REPEATS} runs: {avg_time:.3f} ms")
+        start = time.perf_counter()
+        shared_output.copy_(cpu_tensor)
+        end = time.perf_counter()
+        times_stage1.append((end - start) * 1000)
 
-    print("[CPU] Wrote reduced result into shared output:", shared_output)
+    avg_time_stage1 = sum(times_stage1)/NUM_REPEATS
+    result_queue.put(avg_time_stage1)
 
-    # Signal GPU that reduction is done
     done_event.set()
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)  # safer for CUDA + multiprocessing
+    mp.set_start_method("spawn", force=True)
 
-    # Shared pinned input tensor (large data buffer)
-    shared_input = torch.empty(M, K, dtype=dtype, pin_memory=True)
-    shared_input.share_memory_()
+    shared_hidden_states = torch.empty(M, K, dtype=dtype, pin_memory=True).share_memory_()
+    shared_output = torch.empty(M, K, dtype=dtype, pin_memory=True).share_memory_()
+    shared_topk_weights = torch.empty(M, topk, dtype=torch.float32, pin_memory=True).share_memory_()
+    shared_topk_ids = torch.empty(M, topk, dtype=torch.int32, pin_memory=True).share_memory_()
 
-    # Shared pinned output tensor
-    shared_output = torch.empty(M, K, dtype=dtype, pin_memory=True)
-    shared_output.share_memory_()
+    ready_event = mp.Event()
+    done_event = mp.Event()
+    result_queue = mp.Queue()
 
-    # Events for synchronization
-    ready_event = mp.Event()  # GPU -> CPU
-    done_event = mp.Event()   # CPU -> GPU
-
-    # Launch processes
-    p1 = mp.Process(target=gpu_worker, args=(shared_input, shared_output, ready_event, done_event))
-    p2 = mp.Process(target=cpu_worker, args=(shared_input, shared_output, ready_event, done_event))
+    p1 = mp.Process(target=gpu_worker,
+                    args=(shared_hidden_states, shared_output,
+                          shared_topk_weights, shared_topk_ids,
+                          ready_event, done_event, result_queue))
+    p2 = mp.Process(target=cpu_worker,
+                    args=(shared_hidden_states, shared_output,
+                          shared_topk_weights, shared_topk_ids,
+                          ready_event, done_event, result_queue))
 
     p1.start()
     p2.start()
-
     p1.join()
     p2.join()
